@@ -2,11 +2,12 @@
  * AntiSpamVaccine — Revenge (Mobile Discord) Plugin
  * 
  * 디스코드 크래셔/스팸 메시지를 렌더링 전에 즉시 차단.
- * BetterDiscord v2.2 감지 엔진 이식 — for 루프만 사용, 정규식 없음.
+ * BetterDiscord v2.3 감지 엔진 이식 — for 루프만 사용, 정규식 없음.
  * 
  * 방어 벡터:
  * - 길이 초과 (2000자+)
  * - 연속 반복 문자 (]]]]]]..., !!!!!!!!!... 100회+)
+ * - 마크다운 중첩 크래셔 ([[[[..., ]]]]..., ((((... 30회+)
  * - 스포일러 태그 크래셔 (|| 남용)
  * - 잘고 텍스트 (Combining Characters 도배)
  * - BiDi 오버라이드 크래셔
@@ -36,14 +37,15 @@ const storage = v.storage;
    기본 설정
    ═══════════════════════════════════════════════════════════ */
 const DEFAULT_SETTINGS = {
-    hardLimit: 2000,         // 즉시 차단 글자 수
-    repeatLimit: 100,        // 연속 반복 허용 최대 횟수
-    blockSpoilerAbuse: true, // 스포일러 태그 크래셔
-    blockZalgo: true,        // 잘고 텍스트
-    blockBidi: true,         // BiDi 오버라이드
-    maxNewlines: 30,         // 줄바꿈 도배 임계값
-    maxZeroWidth: 15,        // Zero-width 문자 임계값
-    toastAlert: true,        // 차단 알림
+    hardLimit: 2000,           // 즉시 차단 글자 수
+    repeatLimit: 100,          // 연속 반복 허용 최대 횟수
+    blockMarkdownNest: true,   // 마크다운 중첩 크래셔 (괄호 대량 반복)
+    blockSpoilerAbuse: true,   // 스포일러 태그 크래셔
+    blockZalgo: true,          // 잘고 텍스트
+    blockBidi: true,           // BiDi 오버라이드
+    maxNewlines: 30,           // 줄바꿈 도배 임계값
+    maxZeroWidth: 15,          // Zero-width 문자 임계값
+    toastAlert: true,          // 차단 알림
 };
 
 /* ═══════════════════════════════════════════════════════════
@@ -77,7 +79,7 @@ function initSettings() {
 /* ═══════════════════════════════════════════════════════════
    스팸/크래셔 감지 엔진
    ─────────────────────────────────────────────────────────
-   BetterDiscord v2.2와 동일한 엔진
+   BetterDiscord v2.3과 동일한 엔진
    규칙: 정규식 절대 금지, for 루프만 사용
    ═══════════════════════════════════════════════════════════ */
 function detectSpam(content) {
@@ -118,7 +120,34 @@ function detectSpam(content) {
         };
     }
 
-    // ━━━ 3. 스포일러 태그 크래셔: || 남용 ━━━
+    // ━━━ 3. 마크다운 중첩 크래셔: 괄호 대량 반복 ━━━
+    // [[[[ ]]]] (((( )))) 같은 패턴은 마크다운 링크 파서를
+    // 지수 시간 백트래킹에 빠뜨림 → 프레임 프리즈
+    if (s.blockMarkdownNest) {
+        const NEST_LIMIT = 30;
+        let bOpen = 0, bClose = 0, pOpen = 0, pClose = 0;
+        let maxB = 0, maxBC = 0, maxP = 0, maxPC = 0;
+        for (let i = 0; i < len; i++) {
+            const ch = content[i];
+            if (ch === "[") { bOpen++; if (bOpen > maxB) maxB = bOpen; } else { bOpen = 0; }
+            if (ch === "]") { bClose++; if (bClose > maxBC) maxBC = bClose; } else { bClose = 0; }
+            if (ch === "(") { pOpen++; if (pOpen > maxP) maxP = pOpen; } else { pOpen = 0; }
+            if (ch === ")") { pClose++; if (pClose > maxPC) maxPC = pClose; } else { pClose = 0; }
+        }
+        const worst = [
+            { ch: "[", n: maxB }, { ch: "]", n: maxBC },
+            { ch: "(", n: maxP }, { ch: ")", n: maxPC }
+        ].sort((a, b) => b.n - a.n)[0];
+
+        if (worst.n >= NEST_LIMIT) {
+            return {
+                type: "마크다운크래셔",
+                detail: `'${worst.ch}' × ${worst.n}회 연속 — 마크다운 파서 과부하`
+            };
+        }
+    }
+
+    // ━━━ 4. 스포일러 태그 크래셔: || 남용 ━━━
     if (s.blockSpoilerAbuse) {
         let spoilerCount = 0;
         for (let i = 0; i < len - 1; i++) {
@@ -135,7 +164,7 @@ function detectSpam(content) {
         }
     }
 
-    // ━━━ 4. 잘고 텍스트 (Combining Characters 도배) ━━━
+    // ━━━ 5. 잘고 텍스트 (Combining Characters 도배) ━━━
     if (s.blockZalgo) {
         let combiningCount = 0;
         for (let i = 0; i < len; i++) {
@@ -158,7 +187,7 @@ function detectSpam(content) {
         }
     }
 
-    // ━━━ 5. BiDi 오버라이드 크래셔 ━━━
+    // ━━━ 6. BiDi 오버라이드 크래셔 ━━━
     if (s.blockBidi) {
         let bidiCount = 0;
         for (let i = 0; i < len; i++) {
@@ -180,7 +209,7 @@ function detectSpam(content) {
         }
     }
 
-    // ━━━ 6. 줄바꿈 도배 ━━━
+    // ━━━ 7. 줄바꿈 도배 ━━━
     let nlCount = 0;
     for (let i = 0; i < len; i++) {
         if (content[i] === "\n") nlCount++;
@@ -192,7 +221,7 @@ function detectSpam(content) {
         };
     }
 
-    // ━━━ 7. Zero-width 문자 도배 ━━━
+    // ━━━ 8. Zero-width 문자 도배 ━━━
     let zwCount = 0;
     for (let i = 0; i < len; i++) {
         const code = content.charCodeAt(i);
