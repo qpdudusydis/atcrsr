@@ -29,6 +29,7 @@ if (!v) {
 
 const findByProps = v.metro?.findByProps ?? v.modules?.finders?.findByProps;
 const before = v.patcher?.before;
+const after = v.patcher?.after;
 const showToast = v.ui?.toasts?.showToast ?? v.toasts?.showToast ?? v.showToast;
 const storage = v.storage;
 
@@ -96,79 +97,57 @@ function detectSpam(content) {
         };
     }
 
-    // ━━━ 아래부터는 hardLimit 이하만 도달 ━━━
+    // ━━━ 초고속 에이징: 극단적으로 짧은 메시지는 검사 건너뜀 ━━━
+    if (len < 10) return null;
 
-    // ━━━ 2. 연속 반복 문자 ━━━
+    // 단일 루프로 모든 문자 스캔 (루프 퓨전 최적화)
     let maxRepeat = 0;
     let maxRepeatChar = "";
     let repeatCount = 1;
-    for (let i = 1; i < len; i++) {
-        if (content[i] === content[i - 1]) {
-            repeatCount++;
-            if (repeatCount > maxRepeat) {
-                maxRepeat = repeatCount;
-                maxRepeatChar = content[i];
-            }
-        } else {
-            repeatCount = 1;
-        }
-    }
-    if (maxRepeat >= s.repeatLimit) {
-        return {
-            type: "반복문자",
-            detail: `'${maxRepeatChar}' × ${maxRepeat}회 연속`
-        };
-    }
 
-    // ━━━ 3. 마크다운 중첩 크래셔: 괄호 대량 반복 ━━━
-    // [[[[ ]]]] (((( )))) 같은 패턴은 마크다운 링크 파서를
-    // 지수 시간 백트래킹에 빠뜨림 → 프레임 프리즈
-    if (s.blockMarkdownNest) {
-        const NEST_LIMIT = 30;
-        let bOpen = 0, bClose = 0, pOpen = 0, pClose = 0;
-        let maxB = 0, maxBC = 0, maxP = 0, maxPC = 0;
-        for (let i = 0; i < len; i++) {
-            const ch = content[i];
+    let bOpen = 0, bClose = 0, pOpen = 0, pClose = 0;
+    let maxB = 0, maxBC = 0, maxP = 0, maxPC = 0;
+
+    let spoilerCount = 0;
+    let combiningCount = 0;
+    let bidiCount = 0;
+    let nlCount = 0;
+    let zwCount = 0;
+
+    for (let i = 0; i < len; i++) {
+        const ch = content[i];
+        const code = content.charCodeAt(i);
+
+        // 1. 연속 반복 문자 (이전 문자와 비교)
+        if (i > 0) {
+            if (ch === content[i - 1]) {
+                repeatCount++;
+                if (repeatCount > maxRepeat) {
+                    maxRepeat = repeatCount;
+                    maxRepeatChar = ch;
+                }
+            } else {
+                repeatCount = 1;
+            }
+        }
+
+        // 2. 마크다운 중첩 괄호 검사
+        if (s.blockMarkdownNest) {
             if (ch === "[") { bOpen++; if (bOpen > maxB) maxB = bOpen; } else { bOpen = 0; }
             if (ch === "]") { bClose++; if (bClose > maxBC) maxBC = bClose; } else { bClose = 0; }
             if (ch === "(") { pOpen++; if (pOpen > maxP) maxP = pOpen; } else { pOpen = 0; }
             if (ch === ")") { pClose++; if (pClose > maxPC) maxPC = pClose; } else { pClose = 0; }
         }
-        const worst = [
-            { ch: "[", n: maxB }, { ch: "]", n: maxBC },
-            { ch: "(", n: maxP }, { ch: ")", n: maxPC }
-        ].sort((a, b) => b.n - a.n)[0];
 
-        if (worst.n >= NEST_LIMIT) {
-            return {
-                type: "마크다운크래셔",
-                detail: `'${worst.ch}' × ${worst.n}회 연속 — 마크다운 파서 과부하`
-            };
+        // 3. 스포일러 태그 (||)
+        if (s.blockSpoilerAbuse && ch === "|" && i < len - 1 && content[i + 1] === "|") {
+            spoilerCount++;
+            i++; // 다음 "|" 문자 건너뛰기
+            continue;
         }
-    }
 
-    // ━━━ 4. 스포일러 태그 크래셔: || 남용 ━━━
-    if (s.blockSpoilerAbuse) {
-        let spoilerCount = 0;
-        for (let i = 0; i < len - 1; i++) {
-            if (content[i] === "|" && content[i + 1] === "|") {
-                spoilerCount++;
-                i++;
-            }
-        }
-        if (spoilerCount > 20) {
-            return {
-                type: "스포일러크래셔",
-                detail: `스포일러 태그 ${spoilerCount}개`
-            };
-        }
-    }
-
-    // ━━━ 5. 잘고 텍스트 (Combining Characters 도배) ━━━
-    if (s.blockZalgo) {
-        let combiningCount = 0;
-        for (let i = 0; i < len; i++) {
-            const code = content.charCodeAt(i);
+        // 4. 잘고 텍스트 (Combining Characters)
+        if (s.blockZalgo) {
             if ((code >= 0x0300 && code <= 0x036F) ||
                 (code >= 0x0489 && code <= 0x0489) ||
                 (code >= 0x1AB0 && code <= 0x1AFF) ||
@@ -179,19 +158,9 @@ function detectSpam(content) {
                 combiningCount++;
             }
         }
-        if (combiningCount > 30) {
-            return {
-                type: "잘고텍스트",
-                detail: `결합문자 ${combiningCount}개`
-            };
-        }
-    }
 
-    // ━━━ 6. BiDi 오버라이드 크래셔 ━━━
-    if (s.blockBidi) {
-        let bidiCount = 0;
-        for (let i = 0; i < len; i++) {
-            const code = content.charCodeAt(i);
+        // 5. BiDi 오버라이드
+        if (s.blockBidi) {
             if (code === 0x200E || code === 0x200F ||
                 code === 0x202A || code === 0x202B ||
                 code === 0x202C || code === 0x202D ||
@@ -201,41 +170,54 @@ function detectSpam(content) {
                 bidiCount++;
             }
         }
-        if (bidiCount > 10) {
-            return {
-                type: "BiDi크래셔",
-                detail: `방향 오버라이드 문자 ${bidiCount}개`
-            };
+
+        // 6. 줄바꿈
+        if (ch === "\n") {
+            nlCount++;
         }
-    }
 
-    // ━━━ 7. 줄바꿈 도배 ━━━
-    let nlCount = 0;
-    for (let i = 0; i < len; i++) {
-        if (content[i] === "\n") nlCount++;
-    }
-    if (nlCount > s.maxNewlines) {
-        return {
-            type: "줄바꿈도배",
-            detail: `줄바꿈 ${nlCount}개`
-        };
-    }
-
-    // ━━━ 8. Zero-width 문자 도배 ━━━
-    let zwCount = 0;
-    for (let i = 0; i < len; i++) {
-        const code = content.charCodeAt(i);
+        // 7. Zero-width 문자
         if (code === 0x200B || code === 0x200C ||
             code === 0x200D || code === 0x2060 ||
             code === 0xFEFF || code === 0x00AD) {
             zwCount++;
         }
     }
+
+    // ━━━ 최종 결과 판정 ━━━
+    if (maxRepeat >= s.repeatLimit) {
+        return { type: "반복문자", detail: `'${maxRepeatChar}' × ${maxRepeat}회 연속` };
+    }
+
+    if (s.blockMarkdownNest) {
+        const worst = [
+            { ch: "[", n: maxB }, { ch: "]", n: maxBC },
+            { ch: "(", n: maxP }, { ch: ")", n: maxPC }
+        ].sort((a, b) => b.n - a.n)[0];
+
+        if (worst.n >= 30) {
+            return { type: "마크다운크래셔", detail: `'${worst.ch}' × ${worst.n}회 연속 — 마크다운 파서 과부하` };
+        }
+    }
+
+    if (s.blockSpoilerAbuse && spoilerCount > 20) {
+        return { type: "스포일러크래셔", detail: `스포일러 태그 ${spoilerCount}개` };
+    }
+
+    if (s.blockZalgo && combiningCount > 30) {
+        return { type: "잘고텍스트", detail: `결합문자 ${combiningCount}개` };
+    }
+
+    if (s.blockBidi && bidiCount > 10) {
+        return { type: "BiDi크래셔", detail: `방향 오버라이드 문자 ${bidiCount}개` };
+    }
+
+    if (nlCount > s.maxNewlines) {
+        return { type: "줄바꿈도배", detail: `줄바꿈 ${nlCount}개` };
+    }
+
     if (zwCount > s.maxZeroWidth) {
-        return {
-            type: "투명문자",
-            detail: `보이지 않는 문자 ${zwCount}개`
-        };
+        return { type: "투명문자", detail: `보이지 않는 문자 ${zwCount}개` };
     }
 
     return null;
@@ -250,6 +232,9 @@ function sanitizeMessage(msg) {
     if (!msg?.content) return;
     if (msg._asv) return;
 
+    // 반복 검사 방지를 위해 즉시 처리됨(Checked) 마크 표시
+    msg._asv = true;
+
     const result = detectSpam(msg.content);
     if (!result) return;
 
@@ -261,7 +246,6 @@ function sanitizeMessage(msg) {
         `🛡️ **[스팸 차단]** ${result.type}\n` +
         `> ${result.detail}\n` +
         `> 원본: ${origLen.toLocaleString()}자 | 미리보기: \`${safePreview}…\``;
-    msg._asv = true;
 
     blockedCount++;
 
@@ -348,7 +332,50 @@ return {
 
         patches.push(unpatch);
 
-        console.log("[ASV] AntiSpamVaccine 로드 완료 — Dispatcher 패치 성공");
+        // ── MessageStore 패치 (로컬 캐시/이미 로드된 메시지 처리) ──
+        try {
+            const MessageStore = findByProps("getMessages", "getMessage");
+            if (MessageStore && after) {
+                // getMessages 패치
+                const unpatchGetMessages = after("getMessages", MessageStore, (args, res) => {
+                    if (res) {
+                        if (res._array && Array.isArray(res._array)) {
+                            for (let i = 0; i < res._array.length; i++) {
+                                sanitizeMessage(res._array[i]);
+                            }
+                        } else if (Array.isArray(res)) {
+                            for (let i = 0; i < res.length; i++) {
+                                sanitizeMessage(res[i]);
+                            }
+                        } else if (typeof res === "object") {
+                            const msgs = res.toArray?.() || res.values?.() || Object.values(res);
+                            if (Array.isArray(msgs)) {
+                                for (let i = 0; i < msgs.length; i++) {
+                                    sanitizeMessage(msgs[i]);
+                                }
+                            }
+                        }
+                    }
+                    return res;
+                });
+                patches.push(unpatchGetMessages);
+
+                // getMessage 패치
+                const unpatchGetMessage = after("getMessage", MessageStore, (args, res) => {
+                    if (res) {
+                        sanitizeMessage(res);
+                    }
+                    return res;
+                });
+                patches.push(unpatchGetMessage);
+
+                console.log("[ASV] MessageStore 패치 성공");
+            }
+        } catch (e) {
+            console.error("[ASV] MessageStore 패치 실패:", e);
+        }
+
+        console.log("[ASV] AntiSpamVaccine 로드 완료 — Dispatcher & MessageStore 패치 성공");
         try {
             showToast?.("🛡️ AntiSpamVaccine 활성화", "success");
         } catch (e) {}
